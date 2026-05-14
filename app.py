@@ -912,6 +912,107 @@ def build_status_payload() -> dict:
     return payload
 
 
+def reconcile_job_output_paths() -> None:
+    """Clear stale completed-job output paths after server-side file deletion."""
+
+    with DOWNLOAD_MANAGER.lock:
+        for job in DOWNLOAD_MANAGER.jobs:
+            if not job.output_path:
+                continue
+
+            if Path(job.output_path).exists():
+                continue
+
+            job.output_path = None
+            if job.state == "completed":
+                job.message = "Completed file removed from server storage"
+
+
+def resolve_storage_target(relative_path: str) -> Path:
+    """Resolve a relative storage path safely inside the configured download directory."""
+
+    root = Path(DOWNLOAD_MANAGER.download_path).resolve()
+    target = (root / relative_path).resolve()
+    if target != root and root not in target.parents:
+        abort(404)
+    return target
+
+
+def prune_empty_directories(path: Path, root: Path) -> None:
+    """Remove empty parent directories up to the download root."""
+
+    current = path
+    while current != root:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def collect_active_storage_paths() -> list[Path]:
+    """Return the server paths currently in use by active downloads."""
+
+    active_paths: list[Path] = []
+    with DOWNLOAD_MANAGER.lock:
+        for job in DOWNLOAD_MANAGER.jobs:
+            if job.state not in ACTIVE_STATES or not job.output_path:
+                continue
+
+            active_paths.append(Path(job.output_path).resolve())
+
+    return active_paths
+
+
+def is_under_any_path(candidate: Path, parents: list[Path]) -> bool:
+    """Return True when the candidate is contained by any listed parent path."""
+
+    for parent in parents:
+        if candidate == parent or parent in candidate.parents:
+            return True
+    return False
+
+
+def build_storage_file_listing() -> dict:
+    """List server-stored files that are not part of an active download."""
+
+    root = Path(DOWNLOAD_MANAGER.download_path).resolve()
+    active_paths = collect_active_storage_paths()
+    files: list[dict] = []
+    total_bytes = 0
+
+    if root.exists():
+        for child in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+            resolved_child = child.resolve()
+            if is_under_any_path(resolved_child, active_paths):
+                continue
+
+            relative_path = resolved_child.relative_to(root).as_posix()
+            size_bytes = resolved_child.stat().st_size
+            total_bytes += size_bytes
+            parent_path = str(Path(relative_path).parent)
+            files.append(
+                {
+                    "name": resolved_child.name,
+                    "relative_path": relative_path,
+                    "parent_path": "/" if parent_path == "." else parent_path,
+                    "size_bytes": size_bytes,
+                    "size_text": format_byte_count(size_bytes),
+                    "modified_at": resolved_child.stat().st_mtime,
+                    "modified_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(resolved_child.stat().st_mtime)),
+                    "download_url": url_for("download_stored_file", relative_path=relative_path),
+                    "delete_url": url_for("delete_stored_file", relative_path=relative_path),
+                }
+            )
+
+    return {
+        "files": files,
+        "file_count": len(files),
+        "total_size_text": format_byte_count(total_bytes),
+        "delete_all_url": url_for("delete_all_stored_files"),
+    }
+
+
 def queue_request_sources(form_data, uploaded_files) -> tuple[dict | None, int]:
     """Queue posted sources and return the response payload plus status code."""
 
@@ -946,6 +1047,7 @@ def create_app() -> Flask:
             fallback_submit_url=url_for("submit_fallback"),
             server_message=request.args.get("message", ""),
             server_message_kind=request.args.get("message_kind", ""),
+            downloads_page_url=url_for("downloads_page"),
         )
 
     @app.get("/health")
@@ -976,6 +1078,75 @@ def create_app() -> Flask:
     @app.get("/api/status")
     def status():
         return jsonify(build_status_payload())
+
+    @app.get("/downloads")
+    def downloads_page():
+        listing = build_storage_file_listing()
+        return render_template(
+            "downloads.html",
+            download_path=DOWNLOAD_MANAGER.download_path,
+            storage_files=listing["files"],
+            storage_file_count=listing["file_count"],
+            storage_total_size_text=listing["total_size_text"],
+            delete_all_url=listing["delete_all_url"],
+            index_url=url_for("index"),
+            server_message=request.args.get("message", ""),
+            server_message_kind=request.args.get("message_kind", ""),
+        )
+
+    @app.get("/downloads/file/<path:relative_path>")
+    def download_stored_file(relative_path: str):
+        target = resolve_storage_target(relative_path)
+        if not target.exists() or not target.is_file():
+            abort(404)
+        return send_from_directory(DOWNLOAD_MANAGER.download_path, relative_path, as_attachment=True)
+
+    @app.post("/downloads/delete/<path:relative_path>")
+    def delete_stored_file(relative_path: str):
+        target = resolve_storage_target(relative_path)
+        if not target.exists() or not target.is_file():
+            abort(404)
+
+        root = Path(DOWNLOAD_MANAGER.download_path).resolve()
+        target.unlink()
+        prune_empty_directories(target.parent, root)
+        reconcile_job_output_paths()
+        return redirect(
+            url_for(
+                "downloads_page",
+                message=f"Deleted {relative_path} from server storage.",
+                message_kind="success",
+            )
+        )
+
+    @app.post("/downloads/delete-all")
+    def delete_all_stored_files():
+        listing = build_storage_file_listing()
+        deleted_count = 0
+        root = Path(DOWNLOAD_MANAGER.download_path).resolve()
+
+        for item in listing["files"]:
+            target = resolve_storage_target(item["relative_path"])
+            if target.exists() and target.is_file():
+                target.unlink()
+                deleted_count += 1
+
+        for directory in sorted((candidate for candidate in root.rglob("*") if candidate.is_dir()), key=lambda item: len(item.parts), reverse=True):
+            prune_empty_directories(directory, root)
+
+        reconcile_job_output_paths()
+        message = (
+            f"Deleted {deleted_count} file(s) from server storage."
+            if deleted_count
+            else "No stored files were available to delete."
+        )
+        return redirect(
+            url_for(
+                "downloads_page",
+                message=message,
+                message_kind="success" if deleted_count else "",
+            )
+        )
 
     @app.get("/downloads/<job_id>")
     def download_single_artifact(job_id: str):

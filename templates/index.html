@@ -70,6 +70,52 @@
             gap: 1rem;
         }
 
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            padding: 0.9rem 1rem;
+            background: rgba(255, 252, 246, 0.72);
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(14px);
+        }
+
+        .topbar-title {
+            font-size: 0.82rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .topbar-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.6rem;
+        }
+
+        .nav-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.75rem 1rem;
+            border-radius: 999px;
+            border: 1px solid rgba(20, 33, 61, 0.1);
+            color: var(--ink);
+            text-decoration: none;
+            font-weight: 700;
+            background: rgba(255, 255, 255, 0.72);
+        }
+
+        .nav-link.active {
+            color: #fff8ef;
+            background: linear-gradient(135deg, var(--accent), #a53a49);
+            border-color: transparent;
+            box-shadow: 0 14px 24px rgba(209, 73, 91, 0.18);
+        }
+
         .hero,
         .composer,
         .summary,
@@ -539,6 +585,13 @@
 </head>
 <body>
     <main>
+        <nav class="topbar" aria-label="Primary">
+            <div class="topbar-title">Torrent Console</div>
+            <div class="topbar-nav">
+                <a class="nav-link active" href="/">Queue</a>
+                <a class="nav-link" href="{{ downloads_page_url }}">Downloads</a>
+            </div>
+        </nav>
         <section class="hero">
             <div class="eyebrow">Flask Torrent Console</div>
             <div class="hero-copy">

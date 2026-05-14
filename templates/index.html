@@ -240,10 +240,34 @@
             box-shadow: 0 18px 26px rgba(209, 73, 91, 0.28);
         }
 
+        button.secondary-button {
+            color: var(--ink);
+            background: linear-gradient(135deg, rgba(20, 33, 61, 0.08), rgba(20, 33, 61, 0.16));
+            box-shadow: none;
+        }
+
+        button.secondary-button:hover {
+            box-shadow: 0 12px 22px rgba(20, 33, 61, 0.14);
+        }
+
         button:disabled {
             opacity: 0.7;
             cursor: wait;
             transform: none;
+        }
+
+        .device-actions {
+            display: grid;
+            gap: 0.7rem;
+            margin: 0.8rem 0 0.65rem;
+        }
+
+        .device-status[data-kind="error"] {
+            color: var(--danger);
+        }
+
+        .device-status[data-kind="success"] {
+            color: var(--success);
         }
 
         .submit-feedback {
@@ -537,6 +561,14 @@
                     <code>http://&lt;host-lan-ip&gt;:5000</code>
                     <p class="meta-note">Run this on the host PC and open the same port from another phone or computer on the same network.</p>
                 </div>
+                <div class="meta-card">
+                    <strong>Device Autosave</strong>
+                    <div class="device-actions">
+                        <button id="choose-device-folder" class="secondary-button" type="button">Choose Device Folder</button>
+                        <button id="download-all-completed" class="secondary-button" type="button">Download All Completed</button>
+                    </div>
+                    <p class="meta-note device-status" id="device-save-status">Auto-save is off. Choose one local device folder and completed files will be saved into a separate subfolder for each queued link.</p>
+                </div>
             </div>
         </section>
 
@@ -625,7 +657,19 @@
         const uploadProgressValue = document.getElementById("upload-progress-value");
         const jobsGrid = document.getElementById("jobs-grid");
         const jobsEmpty = document.getElementById("jobs-empty");
+        const chooseDeviceFolderButton = document.getElementById("choose-device-folder");
+        const downloadAllCompletedButton = document.getElementById("download-all-completed");
+        const deviceSaveStatus = document.getElementById("device-save-status");
         let currentDownloadPath = {{ download_path|tojson }};
+        let latestJobs = [];
+        let autoSaveRootHandle = null;
+        let autoSaveFolderName = "";
+        let autoSaveRunning = false;
+        let bulkDownloadRunning = false;
+        const pendingAutoSaveItems = [];
+        const queuedArtifactKeys = new Set();
+        const savedArtifactKeys = new Set();
+        const autoSaveSupported = window.isSecureContext && "showDirectoryPicker" in window;
 
         function escapeHtml(value) {
             return String(value ?? "")
@@ -650,6 +694,247 @@
 
         function badgeForState(state) {
             return `<span class="badge ${escapeHtml(state)}">${escapeHtml(state)}</span>`;
+        }
+
+        function setDeviceSaveStatus(text, kind = "") {
+            deviceSaveStatus.textContent = text || "";
+            if (kind) {
+                deviceSaveStatus.dataset.kind = kind;
+            } else {
+                delete deviceSaveStatus.dataset.kind;
+            }
+        }
+
+        function sanitizePathSegment(value, fallback = "download") {
+            const sanitized = String(value ?? "")
+                .replace(/[<>:"/\\|?*\x00-\x1f]+/g, " ")
+                .replace(/\s+/g, " ")
+                .trim()
+                .replace(/[. ]+$/g, "");
+            return sanitized || fallback;
+        }
+
+        function buildJobFolderName(job) {
+            const base = sanitizePathSegment(job.label || job.id || "download").slice(0, 72);
+            const suffix = String(job.id || "job").slice(0, 8);
+            return `${base}-${suffix}`;
+        }
+
+        function getCompletedJobs() {
+            return latestJobs.filter((job) => job.state === "completed" && Array.isArray(job.artifacts) && job.artifacts.length > 0);
+        }
+
+        function getArtifactKey(job, artifact) {
+            return `${job.id}::${artifact.name}`;
+        }
+
+        function queueCompletedArtifacts(jobs) {
+            let queuedCount = 0;
+
+            for (const job of jobs) {
+                for (const artifact of job.artifacts || []) {
+                    const key = getArtifactKey(job, artifact);
+                    if (savedArtifactKeys.has(key) || queuedArtifactKeys.has(key)) {
+                        continue;
+                    }
+
+                    queuedArtifactKeys.add(key);
+                    pendingAutoSaveItems.push({ job, artifact, key });
+                    queuedCount += 1;
+                }
+            }
+
+            return queuedCount;
+        }
+
+        async function ensureJobFileHandle(rootHandle, job, artifactName) {
+            let directoryHandle = await rootHandle.getDirectoryHandle(buildJobFolderName(job), { create: true });
+            const pathParts = String(artifactName || "download").split("/").filter(Boolean);
+            const filename = sanitizePathSegment(pathParts.pop() || "download");
+
+            for (const segment of pathParts) {
+                directoryHandle = await directoryHandle.getDirectoryHandle(sanitizePathSegment(segment, "folder"), { create: true });
+            }
+
+            return directoryHandle.getFileHandle(filename, { create: true });
+        }
+
+        async function saveArtifactToDevice(job, artifact) {
+            if (!autoSaveRootHandle) {
+                throw new Error("No device folder is selected.");
+            }
+
+            const response = await fetch(artifact.download_url, { cache: "no-store" });
+            if (!response.ok) {
+                throw new Error(`Download failed with status ${response.status}.`);
+            }
+
+            const fileHandle = await ensureJobFileHandle(autoSaveRootHandle, job, artifact.name);
+            const writable = await fileHandle.createWritable();
+
+            try {
+                if (response.body && typeof response.body.pipeTo === "function") {
+                    await response.body.pipeTo(writable);
+                } else {
+                    await writable.write(await response.blob());
+                    await writable.close();
+                }
+            } catch (error) {
+                try {
+                    await writable.abort();
+                } catch (abortError) {
+                    // Ignore abort failures after a broken stream.
+                }
+                throw error;
+            }
+        }
+
+        function updateDeviceControls() {
+            chooseDeviceFolderButton.disabled = autoSaveRunning || bulkDownloadRunning || !autoSaveSupported;
+            chooseDeviceFolderButton.textContent = autoSaveRootHandle ? "Change Device Folder" : "Choose Device Folder";
+
+            const hasCompletedJobs = getCompletedJobs().length > 0;
+            downloadAllCompletedButton.disabled = bulkDownloadRunning || autoSaveRunning || !hasCompletedJobs;
+            downloadAllCompletedButton.textContent = bulkDownloadRunning ? "Saving Completed Files..." : "Download All Completed";
+        }
+
+        async function processAutoSaveQueue() {
+            if (!autoSaveRootHandle || autoSaveRunning) {
+                return;
+            }
+
+            autoSaveRunning = true;
+            updateDeviceControls();
+
+            try {
+                while (pendingAutoSaveItems.length > 0 && autoSaveRootHandle) {
+                    const nextItem = pendingAutoSaveItems.shift();
+                    if (!nextItem) {
+                        continue;
+                    }
+
+                    queuedArtifactKeys.delete(nextItem.key);
+                    if (savedArtifactKeys.has(nextItem.key)) {
+                        continue;
+                    }
+
+                    setDeviceSaveStatus(
+                        `Saving ${nextItem.artifact.name} into ${buildJobFolderName(nextItem.job)} on this device...`
+                    );
+                    await saveArtifactToDevice(nextItem.job, nextItem.artifact);
+                    savedArtifactKeys.add(nextItem.key);
+                }
+
+                if (autoSaveRootHandle) {
+                    setDeviceSaveStatus(
+                        `Auto-save is active for ${autoSaveFolderName || "the selected folder"}. Each completed link is saved into its own subfolder.`,
+                        "success"
+                    );
+                }
+            } catch (error) {
+                if (error && (error.name === "NotAllowedError" || error.name === "SecurityError")) {
+                    autoSaveRootHandle = null;
+                    autoSaveFolderName = "";
+                    pendingAutoSaveItems.length = 0;
+                    queuedArtifactKeys.clear();
+                    setDeviceSaveStatus("Device folder access was lost. Choose the local folder again.", "error");
+                } else if (error && error.name === "AbortError") {
+                    setDeviceSaveStatus("Device save was canceled before completion.");
+                } else {
+                    setDeviceSaveStatus(`Device save failed: ${error.message || error}`, "error");
+                }
+            } finally {
+                autoSaveRunning = false;
+                updateDeviceControls();
+            }
+        }
+
+        async function chooseDeviceFolder() {
+            if (!autoSaveSupported) {
+                setDeviceSaveStatus(
+                    "This browser cannot auto-save into a chosen local folder here. Use a Chromium browser over HTTPS for device-folder saving.",
+                    "error"
+                );
+                updateDeviceControls();
+                return;
+            }
+
+            try {
+                const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+                autoSaveRootHandle = handle;
+                autoSaveFolderName = handle.name || "the selected folder";
+                setDeviceSaveStatus(
+                    `Auto-save enabled for ${autoSaveFolderName}. Completed links will be saved into separate subfolders automatically.`,
+                    "success"
+                );
+
+                if (queueCompletedArtifacts(getCompletedJobs()) > 0) {
+                    await processAutoSaveQueue();
+                }
+            } catch (error) {
+                if (error && error.name === "AbortError") {
+                    setDeviceSaveStatus("Folder selection was canceled.");
+                } else {
+                    setDeviceSaveStatus(`Could not enable device autosave: ${error.message || error}`, "error");
+                }
+            } finally {
+                updateDeviceControls();
+            }
+        }
+
+        async function triggerBrowserBulkDownload(jobs) {
+            for (const job of jobs) {
+                for (const artifact of job.artifacts || []) {
+                    const link = document.createElement("a");
+                    link.href = artifact.download_url;
+                    link.download = "";
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    await new Promise((resolve) => window.setTimeout(resolve, 220));
+                }
+            }
+        }
+
+        async function downloadAllCompleted() {
+            const completedJobs = getCompletedJobs();
+            if (!completedJobs.length) {
+                setDeviceSaveStatus("No completed files are available yet.");
+                updateDeviceControls();
+                return;
+            }
+
+            bulkDownloadRunning = true;
+            updateDeviceControls();
+
+            try {
+                if (autoSaveSupported) {
+                    if (!autoSaveRootHandle) {
+                        await chooseDeviceFolder();
+                    }
+
+                    if (!autoSaveRootHandle) {
+                        return;
+                    }
+
+                    const queuedCount = queueCompletedArtifacts(completedJobs);
+                    if (queuedCount === 0) {
+                        setDeviceSaveStatus("All completed files from the current list are already saved on this device.", "success");
+                        return;
+                    }
+
+                    await processAutoSaveQueue();
+                    return;
+                }
+
+                setDeviceSaveStatus(
+                    "This browser cannot write into a chosen folder here. Triggering standard browser downloads for completed files instead."
+                );
+                await triggerBrowserBulkDownload(completedJobs);
+            } finally {
+                bulkDownloadRunning = false;
+                updateDeviceControls();
+            }
         }
 
         function renderArtifacts(artifacts) {
@@ -748,8 +1033,14 @@
         }
 
         function applyJobs(jobs) {
-            jobsEmpty.style.display = jobs.length ? "none" : "block";
-            jobsGrid.innerHTML = jobs.map(renderJob).join("");
+            latestJobs = Array.isArray(jobs) ? jobs : [];
+            jobsEmpty.style.display = latestJobs.length ? "none" : "block";
+            jobsGrid.innerHTML = latestJobs.map(renderJob).join("");
+            updateDeviceControls();
+
+            if (autoSaveRootHandle && queueCompletedArtifacts(getCompletedJobs()) > 0) {
+                void processAutoSaveQueue();
+            }
         }
 
         async function refreshStatus() {
@@ -828,6 +1119,21 @@
             request.send(formData);
         });
 
+        chooseDeviceFolderButton.addEventListener("click", () => {
+            void chooseDeviceFolder();
+        });
+
+        downloadAllCompletedButton.addEventListener("click", () => {
+            void downloadAllCompleted();
+        });
+
+        if (!autoSaveSupported) {
+            setDeviceSaveStatus(
+                "Device-folder autosave needs a secure Chromium browser session. On unsupported browsers, the bulk button falls back to normal downloads.",
+                "error"
+            );
+        }
+        updateDeviceControls();
         refreshStatus();
         window.setInterval(refreshStatus, pollIntervalMs);
     </script>

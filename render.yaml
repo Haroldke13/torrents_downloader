@@ -9,7 +9,7 @@ services:
     disk:
       name: downloads
       mountPath: /app/downloads
-      sizeGB: 10
+      sizeGB: 500
     envVars:
       - key: DOWNLOADS_DIR
         value: /app/downloads

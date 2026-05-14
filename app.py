@@ -747,6 +747,9 @@ class DownloadManager:
                     job.message = "Waiting for torrent metadata from peers or trackers"
                 continue
 
+            if name and not job.output_path:
+                job.output_path = str(Path(self.download_path) / name)
+
             job.state = "downloading"
             job.message = "Downloading torrent"
 

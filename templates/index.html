@@ -525,7 +525,7 @@
                 <div class="meta-card">
                     <strong>Host download folder</strong>
                     <code>{{ download_path }}</code>
-                    <p class="meta-note">Downloads always save on the machine running this Flask app. Other devices on the network control the queue and can fetch completed files back through the browser.</p>
+                    <p class="meta-note">Downloads save on the server running this app first. On phones and other client devices, tap the completed-file links after the job finishes to download a copy locally.</p>
                 </div>
                 <div class="meta-card">
                     <strong>Concurrency</strong>
@@ -625,6 +625,7 @@
         const uploadProgressValue = document.getElementById("upload-progress-value");
         const jobsGrid = document.getElementById("jobs-grid");
         const jobsEmpty = document.getElementById("jobs-empty");
+        let currentDownloadPath = {{ download_path|tojson }};
 
         function escapeHtml(value) {
             return String(value ?? "")
@@ -659,7 +660,7 @@
             const items = artifacts.map((artifact) => {
                 return `
                     <div class="artifact">
-                        <a href="${escapeHtml(artifact.download_url)}">${escapeHtml(artifact.name)}</a>
+                        <a href="${escapeHtml(artifact.download_url)}" download>${escapeHtml(artifact.name)}</a>
                         <span class="artifact-size">${escapeHtml(artifact.size_text)}</span>
                     </div>
                 `;
@@ -668,6 +669,7 @@
             return `
                 <div class="artifact-list">
                     <strong>Completed files</strong>
+                    <p class="meta-note">Tap a file to save it to this device.</p>
                     ${items}
                 </div>
             `;
@@ -680,6 +682,8 @@
                 : job.bytes_done > 0
                     ? `${job.bytes_done_text} transferred`
                     : "Waiting for transfer data";
+            const destinationPath = job.output_path
+                || (job.kind === "torrent" ? `${currentDownloadPath} (waiting for torrent metadata)` : currentDownloadPath);
 
             const progressColor = job.state === "failed"
                 ? "linear-gradient(90deg, #b3261e, #e76f51)"
@@ -725,8 +729,8 @@
                             <span>${escapeHtml(job.peers)}</span>
                         </div>
                         <div class="metric">
-                            <strong>Output path</strong>
-                            <span>${escapeHtml(job.output_path || "Pending")}</span>
+                            <strong>Server destination</strong>
+                            <span>${escapeHtml(destinationPath)}</span>
                         </div>
                     </div>
                     ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}
@@ -755,6 +759,7 @@
                     throw new Error("Status request failed");
                 }
                 const payload = await response.json();
+                currentDownloadPath = payload.download_path || currentDownloadPath;
                 applySummary(payload.summary);
                 applyJobs(payload.jobs);
             } catch (error) {

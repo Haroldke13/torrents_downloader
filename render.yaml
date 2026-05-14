@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: movies-and-torrents
+    runtime: docker
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: downloads
+      mountPath: /app/downloads
+      sizeGB: 10
+    envVars:
+      - key: DOWNLOADS_DIR
+        value: /app/downloads
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "1"
+      - key: DOWNLOAD_POLL_INTERVAL
+        value: "1.0"
+      - key: GUNICORN_THREADS
+        value: "4"
+      - key: GUNICORN_TIMEOUT
+        value: "120"

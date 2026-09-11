@@ -7,3 +7,8 @@ Private Limited Articles Joel.docx
 Private_Limited_Articles_Integrated.docx
 TO DO
 .venv/*
+# Local scrape cache / databases - generated at runtime, not source
+*.db
+*.sqlite
+*.sqlite3
+instance/
